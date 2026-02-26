@@ -139,3 +139,597 @@ python agents/s02_tool_use.py
 3. `Edit greet.py to add a docstring to the function`
 4. `Read greet.py to verify the edit worked`
 5. `Run the greet function with bash: python -c "from greet import greet; greet('World')"`
+
+
+
+
+
+```
+Message(id='05eeeba0ba90928f32ae19f3143d7221', container=None, content=[ThinkingBlock(signature='bb5628cb2205c01e68a39ad2a2e946181b007c71e9d173be195c6612cde2ad55', thinking='用户想要找到 scripts 目录并返回其相对路径。我需要先查看当前目录结构，找到 scripts 目录的位置。\n\n让我先查看当前目录下有哪些文件和文件夹。', type='thinking'), 
+
+ToolUseBlock(id='call_function_67y24wi0gq2d_1', caller=None, input={'command': 'ls -la'}, name='bash', type='tool_use')], model='MiniMax-M2.5', role='assistant', stop_reason='tool_use', stop_sequence=None, type='message', usage=Usage(cache_creation=None, cache_creation_input_tokens=None, cache_read_input_tokens=None, inference_geo=None, input_tokens=393, output_tokens=61, server_tool_use=None, service_tier=None), base_resp={'status_code': 0, 'status_msg': ''})
+```
+
+
+
+```
+
+[{'role': 'user', 'content': '先找到scripts目录，并返回该目录的相对路径'}, {'role': 'assistant', 'content': [...]}]
+
+'content': [ThinkingBlock(signature='bb5628cb2205c01e68a39ad2a2e946181b007c71e9d173be195c6612cde2...n\n让我先查看当前目录下有哪些文件和文件夹。', type='thinking'), ToolUseBlock(id='call_function_67y24wi0gq2d_1', caller=None, input={'command': 'ls -la'}, name='bash', type='tool_use')]
+```
+
+
+
+```
+Message(id='05eef32a20055f47ab598b136d57b774', container=None, content=[ThinkingBlock(signature='35e5ed736453c37693d9ae5a0a142005f86dffdc37c45833ad32e10da935fdc8', thinking='用户要求在scripts目录下创建一个all.txt文件。我需要先检查scripts目录是否存在，然后创建这个文件。', type='thinking'), 
+
+ToolUseBlock(id='call_function_un1nnaknbk2t_1', caller=None, input={'command': 'ls -la scripts 2>/dev/null || echo "Directory does not exist"'}, name='bash', type='tool_use')], model='MiniMax-M2.5', role='assistant', stop_reason='tool_use', stop_sequence=None, type='message', usage=Usage(cache_creation=None, cache_creation_input_tokens=None, cache_read_input_tokens=None, inference_geo=None, input_tokens=389, output_tokens=62, server_tool_use=None, service_tier=None), base_resp={'status_code': 0, 'status_msg': ''})
+```
+
+
+
+## 1) s02 在解决什么问题？
+
+你前面写得很清楚：**只有 bash 一个工具时**，智能体所有动作都要拼 shell 命令来完成。
+
+这会带来三类典型痛点：
+
+- **脆弱/不稳定**
+  - `cat` 输出可能被截断（模型端或中间层可能有长度限制）
+  - `sed` 之类替换遇到特殊字符、换行、正则转义就容易翻车
+  - 模型得浪费很多 token 去写“管道命令”，还不一定对
+- **安全风险**
+  - bash 能做的太多了：删库、联网、跑任意程序、读系统敏感路径……
+  - 你想要的是：工具层面把能力“剪裁”到只允许做安全动作
+- **扩展困难**
+  - 如果你用 if/elif 写死 “如果是 bash 就 run_bash()”，以后加工具就得改循环控制流
+
+------
+
+## 2) 核心洞察：**加工具不需要改 agent loop**
+
+s02 的关键点是：把“怎么调用工具”从循环里抽出来，变成一个 **dispatch map（分发映射表）**：
+
+- agent loop 只负责两件事：
+  1. 把消息发给模型
+  2. 如果模型要用工具（tool_use），就把 `block.name` 去映射表里查 handler 执行，再把 tool_result 回给模型
+- 工具怎么实现（read/write/edit/bash），都在循环外实现成独立函数
+
+这样你要扩展工具时，只需要：
+
+- 增加一个 schema（tools 数组里多一个工具）
+- 增加一个 handler 函数
+- 在 `TOOL_HANDLERS` 里加一条映射
+
+循环本身完全不用动。
+
+------
+
+## 3) 这几个关键代码块分别在干什么？
+
+### 3.1 `run_read` 示例
+
+```
+def run_read(path: str, limit: int = None) -> str:
+    text = safe_path(path).read_text()
+    lines = text.splitlines()
+    if limit and limit < len(lines):
+        lines = lines[:limit]
+    return "\n".join(lines)[:50000]
+```
+
+这里体现了两层“安全/稳健”：
+
+- `safe_path(path)`：**路径沙箱化**，只允许在 WORKDIR 里读
+- `[:50000]`：对返回内容做长度上限，避免一次读巨大文件把上下文撑爆
+
+另外 `limit` 是按行截断，方便 “只看前 N 行”。
+
+------
+
+### 3.2 `TOOL_HANDLERS` 分发表
+
+```
+TOOL_HANDLERS = {
+    "bash":       lambda **kw: run_bash(kw["command"]),
+    "read_file":  lambda **kw: run_read(kw["path"], kw.get("limit")),
+    "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
+    "edit_file":  lambda **kw: run_edit(kw["path"], kw["old_text"],
+                                        kw["new_text"]),
+}
+```
+
+这就是“工具名 → 处理函数”的字典。
+
+- 模型说：我要用工具 `"read_file"`，并给 input：`{"path": "...", "limit": 20}`
+- 你的代码查表拿到 lambda，然后把 `block.input` 解包进去执行
+- handler 返回一个字符串，作为 tool_result 回给模型
+
+注意这里用 `lambda **kw` 的原因是：不同工具 schema 字段不同，统一用 kwargs 接收最省事。
+
+------
+
+### 3.3 agent loop 里的 dispatch
+
+```
+for block in response.content:
+    if block.type == "tool_use":
+        handler = TOOL_HANDLERS.get(block.name)
+        output = handler(**block.input) if handler \
+            else f"Unknown tool: {block.name}"
+        results.append({
+            "type": "tool_result",
+            "tool_use_id": block.id,
+            "content": output,
+        })
+messages.append({"role": "user", "content": results})
+```
+
+这里的关键点：
+
+- `response.content` 不是纯文本，而是一个“块列表”（blocks）
+  - 有的块是 `thinking`
+  - 有的块是 `tool_use`
+- 碰到 `tool_use` 就执行
+- 把执行结果包装成：
+  - `type: tool_result`
+  - `tool_use_id: block.id`（对应这次工具调用的 id）
+  - `content: output`（字符串）
+
+再把这些 tool_result 作为 **user role** 的内容 append 回 messages，让模型继续下一轮推理/回答。
+
+------
+
+## 4) 你贴的日志片段在说什么？
+
+你贴了三段类似的 `Message(...)` 打印。它们展示的是：**模型输出了一段 thinking，然后输出了一个 bash 工具调用**，所以本轮停止原因是 `tool_use`，等待你执行工具并把结果回传。
+
+### 4.1 第一段：`ls -la`
+
+```
+Message(
+  id='05eeeba0ba90928f32ae19f3143d7221',
+  content=[
+    ThinkingBlock(... thinking='用户想要找到 scripts 目录并返回其相对路径...'),
+    ToolUseBlock(id='call_function_67y24wi0gq2d_1',
+                 input={'command': 'ls -la'},
+                 name='bash',
+                 type='tool_use')
+  ],
+  model='MiniMax-M2.5',
+  role='assistant',
+  stop_reason='tool_use',
+)
+```
+
+逐字段解释：
+
+- `role='assistant'`：这是模型作为 assistant 给出的输出
+- `content=[...]`：输出由多个 block 组成
+  - `ThinkingBlock(...)`：模型的“思考文本”（不一定展示给用户，取决于系统）
+  - `ToolUseBlock(...)`：模型决定调用工具
+- `ToolUseBlock.name='bash'`：要调用 bash 工具
+- `ToolUseBlock.input={'command': 'ls -la'}`：bash 的参数是 command
+- `stop_reason='tool_use'`：模型停在这里，等外部把工具跑完再继续
+
+**语义上**：用户要找 scripts 目录 → 模型决定先看当前目录结构 → 调 `ls -la`。
+
+------
+
+### 4.2 第二段：messages 里已经记录了什么
+
+```
+[{'role': 'user', 'content': '先找到scripts目录，并返回该目录的相对路径'},
+ {'role': 'assistant', 'content': [...]}]
+```
+
+这说明你的 `messages` 对话历史里现在有两条：
+
+1. 用户请求
+2. assistant 的输出（包含 thinking + tool_use blocks）
+
+下一步你的 agent loop 会：
+
+- 执行这个 tool_use
+- 把 tool_result append 为第三条 `role='user'`
+- 再发给模型进行下一轮
+
+------
+
+### 4.3 第三段：检查 scripts 目录是否存在
+
+```
+ToolUseBlock(
+  input={'command': 'ls -la scripts 2>/dev/null || echo "Directory does not exist"'},
+  name='bash'
+)
+```
+
+这次模型的意图是：用户要在 scripts 目录下创建文件 `all.txt`，那我先确认 scripts 是否存在。
+
+它用了一句 shell 小技巧：
+
+- `ls -la scripts 2>/dev/null`：如果目录不存在，把错误信息丢弃
+- `|| echo "Directory does not exist"`：如果 ls 失败，就输出一句话
+
+这也正好反衬出你前面说的痛点：**为了一个“判断目录是否存在”，模型不得不拼一段 bash 逻辑**。在 s02 里，如果你有 `read_file` / `write_file` / `list_dir` 之类专用工具，这种逻辑可以在工具实现里更可靠地做，不必让模型写 shell。
+
+------
+
+## 5) 把“你贴的日志”放回 s02 的大框架里
+
+你贴的这些 `Message(...)` 日志，本质是在展示：
+
+- 模型输出 tool_use block
+- agent loop 看到 `stop_reason='tool_use'`
+- dispatch map 根据 `block.name` 找 handler
+- 执行工具
+- 把 tool_result 回给模型
+- 模型继续下一轮（比如真正回答：scripts 相对路径是什么，或创建 all.txt）
+
+而 s02 的改进在于：
+ 以后 **不必每次都 bash**，读写编辑文件会用更安全、稳定、受控的工具（safe_path 沙箱也能强制执行）。
+
+
+
+# 问题1
+
+## 1) Dispatch map 解耦：优点、缺点、以及其他常见集成方式
+
+### 优点（为什么工程里很爱用）
+
+- **循环（agent loop）稳定**
+   loop 只做：发模型请求 → 识别 tool_use → 分发执行 → 回传 tool_result。
+   你以后加 10 个工具、换 10 个工具实现，loop 都不用改，降低回归风险。
+- **可测试性强**
+   每个工具 handler 是“输入→输出”的纯函数/近纯函数：
+  - 可以单元测试 `run_read/run_write/run_edit`
+  - 可以模拟异常、边界、权限、路径沙箱等
+  - 甚至可以做 fuzz 测试（比如随机生成 path/内容）
+- **安全策略集中在工具层**
+   `safe_path()`、输出截断、禁止危险模式，都在 handler 里做，比“让模型自觉”可靠得多。
+- **减少控制流复杂度**
+   用 dict lookup 替代 if/elif，工具数量增长不会让 loop 变成一坨难维护的分支链。
+
+### 缺点 / 你迟早会遇到的坑
+
+- **handler 接口容易变得不一致**
+   早期工具少，用 `lambda **kw` 很爽；工具多了后：
+
+  - 参数命名不一致（path vs file_path）
+  - 返回格式不一致（字符串 vs JSON 字符串 vs 二进制）
+  - 错误处理不一致（raise vs 返回 “ERROR: …”）
+
+  解决办法通常是：**统一工具返回 envelope**（比如 `{ok, data, error, meta}`）。
+
+- **工具之间的共享状态不好管**
+   有些工具会共享资源：工作目录、缓存、会话、数据库连接。
+   dispatch map 本身不解决“状态管理”，你需要：
+
+  - 明确哪些工具是纯函数，哪些需要 state
+  - 用 `context` 对象注入依赖（logger、db、workdir、auth、rate limit）
+
+- **工具多了后，权限/能力边界更复杂**
+   你会开始需要：
+
+  - RBAC/allowlist（这个 agent 能用哪些工具）
+  - tool-level 审计日志
+  - 速率限制、配额、超时、隔离
+
+- **调试可观测性要额外建设**
+   哪个工具被调用、输入输出多大、耗时多少、失败率多少——需要埋点。
+
+------
+
+### 还有哪些“工具调用与 loop 结合”的常见方法？
+
+#### 方法 A：if/elif 硬编码分支（最原始）
+
+- 优点：简单直观
+- 缺点：工具一多就灾难，难测、难扩展
+
+#### 方法 B：插件/注册表（dispatch map 的工程化升级）
+
+本质还是 map，但更工程：
+
+- 装饰器注册：`@tool("read_file")`
+- 自动从 schema 生成 handler wrapper
+- 支持中间件：日志/鉴权/超时/重试/指标
+
+你可以把它理解为“可插拔的 dispatch map”。
+
+#### 方法 C：多步工具编排（Planner + Executor）
+
+- **Planner（模型）**产出计划（步骤、工具、依赖）
+- **Executor（代码）**按计划执行、收集结果、必要时回问模型修正
+- 优点：复杂任务更稳
+- 缺点：实现更复杂，需要 plan 格式、失败恢复策略
+
+#### 方法 D：函数调用路由器（规则/模型混合）
+
+不是完全交给 LLM 决定用哪个工具，而是：
+
+- 先由代码/规则判断“应该用什么类工具”
+- LLM 只填参数或做解释
+- 适合高安全场景（比如支付、删数据）
+
+#### 方法 E：工具调用作为“子 agent”（tool = agent）
+
+每个工具背后不是一个函数，而是一个专用小 agent：
+
+- 例：`coding_agent`、`sql_agent`、`browser_agent`
+- loop 调用的是“子 agent 入口”
+- 优点：每个子 agent 有自己的系统提示词和工具集，更可控
+- 缺点：复杂、调用成本高
+
+------
+
+## 2) 工具越来越多会撑爆上下文吗？不使用 skills 的常见解决方案是什么？
+
+先说结论：**真正撑爆上下文的通常不是“dispatch map 变大”，而是“你把所有工具的说明/参数/schema 全塞进模型上下文”**。
+ dispatch map 是在代码里，模型看不见；模型看到的是你传给它的 `tools` 定义（schema、描述、参数说明）。
+
+### 不用 skills 时，业界最常见的 4 类做法
+
+#### 做法 1：工具集分层/分组，只暴露“当前需要的工具”
+
+- 把工具分成域：文件类、网络类、代码执行类、数据库类……
+- 每轮对话只把相关组的 tools 传给模型
+   例：用户在写代码 → 暴露 read/write/edit/bash
+   用户在查天气 → 暴露 weather tool
+- 这叫 **tool gating / tool scoping**，是最主流的做法
+
+关键点：由代码做一个轻量“工具选择器”
+
+- 规则（关键词/状态机）
+- 或一个小模型做 tool-rerank（成本低）
+
+#### 做法 2：两段式调用（先选工具，再给详细 schema）
+
+- 第一步：只给模型一个“工具目录”（很短：工具名 + 一句话）
+- 模型先说：我要用 `read_file`
+- 第二步：你再把 `read_file` 的完整 schema 发给它，让它填参数
+
+好处：**绝大多数轮次都不用携带所有 schema**。
+
+#### 做法 3：压缩工具描述（schema 精简 + 描述外置）
+
+- schema 里只放最必要字段、类型、最短描述
+- 长文档（安全限制、示例、边界条件）不放 tools 里
+   改成：
+  - 在工具实现里强制校验
+  - 出错时返回结构化错误，让模型迭代修正
+
+这是很多框架走向成熟后的现实选择：**把规则从 prompt 挪到代码**。
+
+#### 做法 4：工具检索（Tool Retrieval）
+
+当工具上百个时，常用：
+
+- 给每个工具做一条 embedding（名字+描述+参数）
+- 每轮根据用户意图检索 top-k 工具
+- 只把 top-k 工具 schema 放进上下文
+
+这其实就是“skills 的思想”，但你不叫 skills 也一样能做。
+
+------
+
+### “不用 skills”时，还有一个容易忽略但很重要的点
+
+**让工具返回更结构化、更短的结果**，否则输出也会撑爆上下文。
+
+典型策略：
+
+- 工具返回 `{summary, data, next_actions}`，并强制截断 data
+- 对大内容走“文件句柄/引用”策略：保存到本地文件，只回传路径/摘要
+- 分页读取：`read_file(path, offset, limit)` 而不是一次全读
+
+
+
+# 问题2
+
+“**句柄（handle）**”是个在很多系统里都会出现的概念（操作系统、数据库、GUI、文件系统、网络库……），但初学者常常只在 MySQL / JDBC 里听过，却没真正理解。
+
+我用 **通俗解释 → 技术定义 → MySQL 场景 → 类比** 四层来讲清楚。
+
+------
+
+## 一句话通俗解释
+
+> **句柄 = 一个“间接引用的凭证 / ID”，用来代表某个资源，而不是资源本身**
+
+你可以把句柄理解成：
+
+- 不是文件本身，而是“文件的编号”
+- 不是数据库连接本身，而是“连接的标识”
+- 不是对象本身，而是“对象的引用钥匙”
+
+------
+
+## 技术一点的定义
+
+在计算机系统中：
+
+> **Handle 是一个抽象标识符，用来让程序访问底层资源，而隐藏资源的真实实现细节**
+
+特点：
+
+- 通常是整数、指针、token、引用ID
+- 本身不包含资源内容
+- 由系统维护映射关系：
+   `handle → 实际资源`
+
+------
+
+## 为什么需要句柄？
+
+因为程序不应该直接操作底层资源结构：
+
+| 如果没有句柄                 | 会发生什么       |
+| ---------------------------- | ---------------- |
+| 程序直接拿到文件结构体       | 可以乱改，系统崩 |
+| 程序直接拿 socket 内核对象   | 极高风险         |
+| 程序直接拿数据库内部连接对象 | 不安全、不稳定   |
+
+**句柄的作用：**
+
+✅ 隔离
+ ✅ 安全
+ ✅ 抽象
+ ✅ 易管理生命周期
+
+------
+
+## MySQL / 数据库里常见的“句柄”
+
+在数据库语境里，句柄这个词不总是显式说出来，但概念一直存在。
+
+### 1️⃣ 连接句柄（Connection Handle）
+
+当你：
+
+```
+mysql -u root -p
+```
+
+服务器会：
+
+- 创建一个连接对象
+- 分配一个 connection id（比如 123）
+
+这个 ID 本质就是 **连接句柄**
+
+你看到的：
+
+```
+SHOW PROCESSLIST;
+```
+
+里面的 `Id` 列，就是句柄的一种形式。
+
+------
+
+### 2️⃣ 游标句柄（Cursor Handle）
+
+在存储过程 / API 中：
+
+```
+DECLARE cur CURSOR FOR SELECT ...
+```
+
+数据库内部会创建：
+
+- 游标对象
+- 返回一个标识符（句柄）
+
+程序用这个句柄：
+
+- FETCH
+- CLOSE
+
+------
+
+### 3️⃣ 语句句柄（Statement Handle）
+
+在编程接口中非常常见：
+
+例如 Python：
+
+```
+cursor.execute("SELECT * FROM users")
+```
+
+JDBC：
+
+```
+PreparedStatement ps = conn.prepareStatement(sql);
+```
+
+`ps` 就是一个语句句柄（代表 SQL 执行对象）
+
+------
+
+### 4️⃣ 锁句柄 / 事务上下文
+
+数据库内部管理：
+
+- 行锁
+- 表锁
+- 事务状态
+
+都是通过句柄/ID引用，而不是直接暴露结构。
+
+------
+
+## 一个非常重要的理解（对 agent 很关键）
+
+> **句柄是“轻量引用”，避免把大对象塞进上下文或跨层传递**
+
+这在 agent / LLM 系统里超级常见：
+
+### 举例：工具返回大文件
+
+❌ 不好的方式：
+
+```
+tool_result:
+<整个10万行文件内容>
+```
+
+✅ 好的方式（句柄思想）：
+
+```
+tool_result:
+{
+  "file_handle": "file_abc123",
+  "summary": "...",
+  "preview": "前200行"
+}
+```
+
+后续模型再说：
+
+```
+read_file(handle="file_abc123", offset=200)
+```
+
+👉 **句柄 = 模型与真实资源之间的桥梁**
+
+------
+
+## 用生活类比理解
+
+| 场景     | 资源     | 句柄          |
+| -------- | -------- | ------------- |
+| 图书馆   | 一本书   | 借书证编号    |
+| 酒店     | 房间     | 房卡          |
+| 银行     | 钱       | 账户号        |
+| 文件系统 | 文件内容 | 文件描述符 fd |
+| 数据库   | 连接对象 | connection id |
+
+你拿的是“凭证”，不是“实体”。
+
+------
+
+## 常见误区
+
+❌ 句柄不是数据
+ ❌ 句柄不是对象本身
+ ❌ 句柄不是路径（路径是定位方式，句柄是已分配引用）
+
+✅ 句柄是“系统认可的访问标识”
+
+------
+
+## 总结一句话
+
+> **句柄 = 程序访问资源的“钥匙 / ID / 引用令牌”，用于抽象、隔离和安全管理**
+
+------
+
+如果你正在学 agent，这个概念非常重要，因为：
+
+- 长文本 / 大文件 / 会话状态 → 都适合句柄化
+- 可以避免上下文爆炸
+- 可以支持分页、延迟加载、跨轮次引用
