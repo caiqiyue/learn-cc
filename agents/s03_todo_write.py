@@ -43,7 +43,9 @@ client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
 
 SYSTEM = f"""You are a coding agent at {WORKDIR}.
-Use the todo tool to plan multi-step tasks. Mark in_progress before starting, completed when done.
+Before doing any work, use the todo tool to create a task list from the user's request.
+Then execute tasks one by one: mark one task in_progress before starting it, and mark it completed right after finishing it.
+Do not backfill todos after all work is done. Keep todo status updated in real time while working.
 Prefer tools over prose."""
 
 
