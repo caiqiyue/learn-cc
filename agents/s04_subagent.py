@@ -23,6 +23,7 @@ Key insight: "Process isolation gives context isolation for free."
 """
 
 import os
+import locale
 import subprocess
 from pathlib import Path
 
@@ -54,9 +55,18 @@ def run_bash(command: str) -> str:
     if any(d in command for d in dangerous):
         return "Error: Dangerous command blocked"
     try:
-        r = subprocess.run(command, shell=True, cwd=WORKDIR,
-                           capture_output=True, text=True, timeout=120)
-        out = (r.stdout + r.stderr).strip()
+        r = subprocess.run(
+            command,
+            shell=True,
+            cwd=WORKDIR,
+            capture_output=True,
+            text=False,
+            timeout=120,
+        )
+        encoding = locale.getpreferredencoding(False) or "utf-8"
+        stdout = (r.stdout or b"").decode(encoding, errors="replace")
+        stderr = (r.stderr or b"").decode(encoding, errors="replace")
+        out = (stdout + stderr).strip()
         return out[:50000] if out else "(no output)"
     except subprocess.TimeoutExpired:
         return "Error: Timeout (120s)"
@@ -125,7 +135,7 @@ def run_subagent(prompt: str) -> str:
         results = []
         for block in response.content:
             if block.type == "tool_use":
-                handler = TOOL_HANDLERS.get(block.name)
+                handler = TOOL_HANDLERS.get(block.name)#子代理和父代理共享工具包
                 output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
                 results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)[:50000]})
         sub_messages.append({"role": "user", "content": results})
@@ -153,9 +163,9 @@ def agent_loop(messages: list):
         for block in response.content:
             if block.type == "tool_use":
                 if block.name == "task":
-                    desc = block.input.get("description", "subtask")
+                    desc = block.input.get("description", "subtask") #find testing framework
                     print(f"> task ({desc}): {block.input['prompt'][:80]}")
-                    output = run_subagent(block.input["prompt"])
+                    output = run_subagent(block.input["prompt"]) #子代理把任务结果交给父代理，父代理不关心任务执行的中间过程
                 else:
                     handler = TOOL_HANDLERS.get(block.name)
                     output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
