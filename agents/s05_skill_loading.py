@@ -29,12 +29,15 @@ Key insight: "Don't put everything in the system prompt. Load on demand."
 """
 
 import os
+import logging
 import re
 import subprocess
 from pathlib import Path
+from typing import Any
 
 from anthropic import Anthropic
 from dotenv import load_dotenv
+import yaml
 
 load_dotenv(override=True)
 
@@ -44,35 +47,64 @@ if os.getenv("ANTHROPIC_BASE_URL"):
 WORKDIR = Path.cwd()
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
-SKILLS_DIR = WORKDIR / ".skills"
+SKILLS_DIR = WORKDIR / "skills"
+LOGGER = logging.getLogger(__name__)
 
 
-# -- SkillLoader: parse .skills/*.md files with YAML frontmatter --
+# -- SkillLoader: parse skills/*.md files with YAML frontmatter --
 class SkillLoader:
     def __init__(self, skills_dir: Path):
         self.skills_dir = skills_dir
-        self.skills = {}
+        self.skills: dict[str, dict[str, Any]] = {}
+        self.load_errors: list[str] = []
         self._load_all()
 
-    def _load_all(self):
-        if not self.skills_dir.exists():
+    def _load_all(self) -> None:
+        self.skills.clear()
+        self.load_errors.clear()
+        if not self.skills_dir.is_dir():
             return
-        for f in sorted(self.skills_dir.glob("*.md")):
-            name = f.stem
-            text = f.read_text()
-            meta, body = self._parse_frontmatter(text)
-            self.skills[name] = {"meta": meta, "body": body, "path": str(f)}
+        for f in self._iter_skill_files():
+            try:
+                skill = self._load_skill(f)
+                name = self._skill_name(f, skill["meta"])
+                if name in self.skills:
+                    raise ValueError(f"duplicate skill name '{name}'")
+                self.skills[name] = skill
+            except Exception as e:
+                message = f"Skipping skill '{f.name}': {e}"
+                self.load_errors.append(message)
+                LOGGER.warning(message)
 
-    def _parse_frontmatter(self, text: str) -> tuple:
+    def _iter_skill_files(self) -> list[Path]:
+        flat_files = sorted(self.skills_dir.glob("*.md"))
+        nested_skill_files = sorted(self.skills_dir.glob("*/SKILL.md"))
+        return flat_files + nested_skill_files
+
+    def _load_skill(self, path: Path) -> dict[str, Any]:
+        text = path.read_text(encoding="utf-8-sig")
+        meta, body = self._parse_frontmatter(text, source=path)
+        return {"meta": meta, "body": body, "path": str(path)}
+
+    def _skill_name(self, path: Path, meta: dict[str, Any]) -> str:
+        name = meta.get("name")
+        if isinstance(name, str) and name.strip():
+            return name.strip()
+        if path.name.lower() == "skill.md":
+            return path.parent.name
+        return path.stem
+
+    def _parse_frontmatter(self, text: str, source: Path | None = None) -> tuple[dict[str, Any], str]:
         """Parse YAML frontmatter between --- delimiters."""
-        match = re.match(r"^---\n(.*?)\n---\n(.*)", text, re.DOTALL)
+        normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+        match = re.match(r"^---\n(.*?)\n---(?:\n|$)(.*)\Z", normalized, re.DOTALL)
         if not match:
-            return {}, text
-        meta = {}
-        for line in match.group(1).strip().splitlines():
-            if ":" in line:
-                key, val = line.split(":", 1)
-                meta[key.strip()] = val.strip()
+            return {}, normalized.strip()
+
+        meta = yaml.safe_load(match.group(1)) or {}
+        if not isinstance(meta, dict):
+            origin = source.name if source else "<memory>"
+            raise ValueError(f"{origin} frontmatter must be a YAML mapping")
         return meta, match.group(2).strip()
 
     def get_descriptions(self) -> str:
@@ -81,8 +113,13 @@ class SkillLoader:
             return "(no skills available)"
         lines = []
         for name, skill in self.skills.items():
-            desc = skill["meta"].get("description", "No description")
-            tags = skill["meta"].get("tags", "")
+            meta = skill["meta"]
+            desc = " ".join(str(meta.get("description", "No description")).split())
+            tags = meta.get("tags", "")
+            if isinstance(tags, list):
+                tags = ", ".join(str(tag) for tag in tags)
+            elif tags:
+                tags = str(tags)
             line = f"  - {name}: {desc}"
             if tags:
                 line += f" [{tags}]"
@@ -207,6 +244,7 @@ if __name__ == "__main__":
             query = input("\033[36ms05 >> \033[0m")
         except (EOFError, KeyboardInterrupt):
             break
+
         if query.strip().lower() in ("q", "exit", ""):
             break
         history.append({"role": "user", "content": query})
